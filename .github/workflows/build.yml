@@ -41,6 +41,22 @@ jobs:
           EOF
           done
 
+      - name: Diagnose
+        run: |
+          echo "--- settings"
+          cat ~/.config/godot/editor_settings-4.3.tres
+          echo "--- keystore"
+          ls -la debug.keystore
+          echo "--- sdk"
+          ls /usr/lib/android-sdk
+          ls /usr/lib/android-sdk/build-tools
+          ls /usr/lib/android-sdk/platforms
+          ls /usr/lib/android-sdk/cmdline-tools
+          echo "--- templates"
+          ls ~/.local/share/godot/export_templates/4.3.stable
+          echo "--- java"
+          java -version 2>&1
+
       - name: Export APK
         run: |
           mkdir -p build
