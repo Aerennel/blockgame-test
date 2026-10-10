@@ -58,11 +58,8 @@ jobs:
           java -version 2>&1
 
       - name: Export APK
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p build
-          godot --headless --verbose --export-debug "Android" build/blockgame.apk
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: blockgame-apk
-          path: build/blockgame.apk
+          godot --headless --verbose --export-debug "Android" build/blockgame.apk 2>&1 | grep -v "is not exposed"
