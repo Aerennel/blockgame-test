@@ -2,8 +2,8 @@ extends Node3D
 
 const SIZE := 128
 const HALF := SIZE / 2
-const HEIGHT := 32
-const WATER := 3
+const HEIGHT := 40
+const WATER := 12
 const WL := WATER + 0.4
 const CHUNK := 16
 const CN := (SIZE + CHUNK - 1) / CHUNK
@@ -20,7 +20,7 @@ const REPEAT := 0.22
 
 const SAVE_PATH := "user://world.dat"
 const SAVE_TMP := "user://world.tmp"
-const SAVE_VERSION := 1
+const SAVE_VERSION := 2
 
 const GRASS := 1
 const DIRT := 2
@@ -60,11 +60,15 @@ var selected := 0
 var blocks := PackedByteArray()
 var heights := PackedInt32Array()
 var col_top := PackedInt32Array()
+var water_map := PackedByteArray()
 var chunks := {}
 var gchunks := {}
+var water_node: MultiMeshInstance3D
 var box_mesh: BoxMesh
+var plane_mesh: PlaneMesh
 var block_mat: StandardMaterial3D
 var glass_mat: StandardMaterial3D
+var water_mat: StandardMaterial3D
 var cam: Camera3D
 var hud: Hud
 var pos := Vector3.ZERO
@@ -95,13 +99,18 @@ var btn_new: Button
 
 func _ready():
 	box_mesh = BoxMesh.new()
+	plane_mesh = PlaneMesh.new()
+	plane_mesh.size = Vector2(1, 1)
 	block_mat = StandardMaterial3D.new()
 	block_mat.vertex_color_use_as_albedo = true
 	glass_mat = StandardMaterial3D.new()
 	glass_mat.vertex_color_use_as_albedo = true
 	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	water_mat = StandardMaterial3D.new()
+	water_mat.albedo_color = Color(0.2, 0.45, 0.85, 0.65)
+	water_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	water_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	setup_env()
-	add_water()
 	cam = Camera3D.new()
 	cam.near = 0.05
 	cam.far = 400.0
@@ -122,6 +131,7 @@ func _ready():
 		generate_world()
 		spawn()
 	build_all_chunks()
+	build_water()
 	world_ready = true
 
 func _notification(what):
@@ -185,6 +195,18 @@ func is_clear(x: int, y: int, z: int) -> bool:
 	var t := blocks[idx(x, y, z)]
 	return t == 0 or t == GLASS
 
+func water_at(wx: float, wy: float, wz: float) -> bool:
+	if wy > WL:
+		return false
+	var x := roundi(wx)
+	var y := roundi(wy)
+	var z := roundi(wz)
+	if x < 0 or x >= SIZE or z < 0 or z >= SIZE:
+		return false
+	if water_map[x * SIZE + z] == 0:
+		return false
+	return get_type(x, y, z) == 0
+
 func generate_world():
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
@@ -197,32 +219,42 @@ func generate_world():
 	var cave_b := FastNoiseLite.new()
 	cave_b.seed = rng.randi()
 	cave_b.frequency = 0.06
+	var cave_c := FastNoiseLite.new()
+	cave_c.seed = rng.randi()
+	cave_c.frequency = 0.04
 	blocks.resize(SIZE * SIZE * HEIGHT)
 	blocks.fill(0)
 	heights.resize(SIZE * SIZE)
+	water_map.resize(SIZE * SIZE)
+	water_map.fill(0)
 	col_top.resize(SIZE * SIZE)
 	col_top.fill(0)
 	for x in range(SIZE):
 		for z in range(SIZE):
-			var h := int(round(noise.get_noise_2d(x - HALF, z - HALF) * 9.0 + 5.0))
-			h = clampi(h, 1, 14)
+			var h := int(round(noise.get_noise_2d(x - HALF, z - HALF) * 9.0 + 14.0))
+			h = clampi(h, 2, 24)
 			heights[x * SIZE + z] = h
+			if h < WATER:
+				water_map[x * SIZE + z] = 1
 			for y in range(h + 1):
 				var t := STONE
 				if y == h:
 					if h <= WATER + 1:
 						t = SAND
-					elif h >= 11:
+					elif h >= 20:
 						t = SNOW
-					elif h >= 9:
+					elif h >= 18:
 						t = STONE
 					else:
 						t = GRASS
-				elif h < 9 and y > h - 4:
+				elif h < 18 and y > h - 4:
 					t = DIRT
 				else:
-					if y >= 4 and absf(cave_a.get_noise_3d(x, y, z)) < 0.11 and absf(cave_b.get_noise_3d(x, y, z)) < 0.11:
-						continue
+					if h >= WATER + 2 and y >= 3:
+						if absf(cave_a.get_noise_3d(x, y, z)) < 0.13 and absf(cave_b.get_noise_3d(x, y, z)) < 0.13:
+							continue
+						if y < h - 6 and cave_c.get_noise_3d(x, y, z) > 0.52:
+							continue
 					var r := rng.randf()
 					if y < h - 2 and r < 0.02:
 						if r < 0.001:
@@ -237,7 +269,7 @@ func generate_world():
 	for x in range(3, SIZE - 3):
 		for z in range(3, SIZE - 3):
 			var h2 := heights[x * SIZE + z]
-			if h2 > WATER + 1 and h2 < 9 and rng.randf() < 0.015:
+			if h2 > WATER + 1 and h2 < 18 and rng.randf() < 0.015:
 				add_tree(x, h2, z)
 
 func add_tree(x: int, h: int, z: int):
@@ -285,6 +317,8 @@ func save_world():
 	f.store_32(selected)
 	f.store_32(blocks.size())
 	f.store_buffer(blocks)
+	f.store_32(water_map.size())
+	f.store_buffer(water_map)
 	f.close()
 	var d := DirAccess.open("user://")
 	if d:
@@ -315,10 +349,16 @@ func load_world() -> bool:
 		f.close()
 		return false
 	var data := f.get_buffer(n)
+	var wn := f.get_32()
+	if wn != SIZE * SIZE:
+		f.close()
+		return false
+	var wdata := f.get_buffer(wn)
 	f.close()
-	if data.size() != n:
+	if data.size() != n or wdata.size() != wn:
 		return false
 	blocks = data
+	water_map = wdata
 	rebuild_columns()
 	pos = Vector3(px, py, pz)
 	yaw = yw
@@ -335,6 +375,7 @@ func new_world():
 	yaw = 0.0
 	pitch = 0.0
 	build_all_chunks()
+	build_water()
 	save_world()
 
 func shade(x: int, y: int, z: int) -> float:
@@ -345,11 +386,11 @@ func build_all_chunks():
 		for cz in range(CN):
 			build_chunk(cx, cz)
 
-func make_mm(positions: Array[Vector3], colors: Array[Color]) -> MultiMesh:
+func make_mm(positions: Array[Vector3], colors: Array[Color], mesh: Mesh) -> MultiMesh:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
-	mm.mesh = box_mesh
+	mm.mesh = mesh
 	mm.instance_count = positions.size()
 	for i in positions.size():
 		mm.set_instance_transform(i, Transform3D(Basis(), positions[i]))
@@ -388,8 +429,23 @@ func build_chunk(cx: int, cz: int):
 					positions.append(Vector3(x, y, z))
 					colors.append(Color(c.r * s, c.g * s, c.b * s))
 	var key := Vector2i(cx, cz)
-	set_chunk_node(chunks, key, make_mm(positions, colors), block_mat)
-	set_chunk_node(gchunks, key, make_mm(gpos, gcols), glass_mat)
+	set_chunk_node(chunks, key, make_mm(positions, colors, box_mesh), block_mat)
+	set_chunk_node(gchunks, key, make_mm(gpos, gcols, box_mesh), glass_mat)
+
+func build_water():
+	var positions: Array[Vector3] = []
+	var colors: Array[Color] = []
+	for x in range(SIZE):
+		for z in range(SIZE):
+			if water_map[x * SIZE + z] == 1:
+				positions.append(Vector3(x, WL, z))
+				colors.append(Color(1, 1, 1, 1))
+	var mm := make_mm(positions, colors, plane_mesh)
+	if water_node == null:
+		water_node = MultiMeshInstance3D.new()
+		water_node.material_override = water_mat
+		add_child(water_node)
+	water_node.multimesh = mm
 
 func rebuild_around(x: int, z: int):
 	var cx := x / CHUNK
@@ -406,20 +462,6 @@ func rebuild_around(x: int, z: int):
 		list[Vector2i(cx, cz + 1)] = true
 	for k in list.keys():
 		build_chunk(k.x, k.y)
-
-func add_water():
-	var plane := MeshInstance3D.new()
-	var pm := PlaneMesh.new()
-	pm.size = Vector2(SIZE, SIZE)
-	plane.mesh = pm
-	var wm := StandardMaterial3D.new()
-	wm.albedo_color = Color(0.2, 0.45, 0.85, 0.65)
-	wm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	wm.cull_mode = BaseMaterial3D.CULL_DISABLED
-	plane.material_override = wm
-	var c := (SIZE - 1) * 0.5
-	plane.position = Vector3(c, WL, c)
-	add_child(plane)
 
 func spawn():
 	var best := Vector2i(HALF, HALF)
@@ -664,7 +706,7 @@ func _process(delta: float):
 	hud.break_pos = break_center(sz)
 	hud.place_pos = place_center(sz)
 	hud.pause_pos = pause_center(sz)
-	hud.underwater = pos.y + EYE < WL
+	hud.underwater = water_at(pos.x, pos.y + EYE, pos.z)
 	var rects: Array[Rect2] = []
 	for i in range(hotbar.size()):
 		rects.append(slot_rect(i, sz))
@@ -678,7 +720,7 @@ func _process(delta: float):
 	if dirty and save_timer > 15.0:
 		save_world()
 
-	in_water = pos.y + 0.6 < WL
+	in_water = water_at(pos.x, pos.y + 0.6, pos.z)
 	var spd := SPEED
 	if in_water:
 		spd = SPEED * 0.6
