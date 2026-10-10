@@ -1,4 +1,4 @@
-9extends Node3D
+extends Node3D
 
 const SIZE := 48
 const HALF := SIZE / 2
