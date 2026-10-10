@@ -25,12 +25,16 @@ jobs:
 
       - name: Editor settings
         run: |
+          JAVA_BIN=$(readlink -f $(which jarsigner))
+          JAVA_DIR=$(dirname $(dirname $JAVA_BIN))
+          echo "Java: $JAVA_DIR"
           for n in 4 4.3; do
           cat > ~/.config/godot/editor_settings-$n.tres <<EOF
           [gd_resource type="EditorSettings" format=3]
 
           [resource]
           export/android/android_sdk_path = "/usr/lib/android-sdk"
+          export/android/java_sdk_path = "$JAVA_DIR"
           export/android/debug_keystore = "$PWD/debug.keystore"
           export/android/debug_keystore_user = "androiddebugkey"
           export/android/debug_keystore_pass = "android"
