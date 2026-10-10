@@ -56,6 +56,10 @@ jobs:
           echo "--- java"
           java -version 2>&1
 
+      - name: Run check
+        run: |
+          timeout 120 godot --headless --path . --quit-after 100 2>&1 | tail -n 40 || true
+
       - name: Export APK
         shell: bash
         run: |
