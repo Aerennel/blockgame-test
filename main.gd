@@ -1,6 +1,6 @@
 extends Node3D
 
-const SIZE := 48
+const SIZE := 128
 const HALF := SIZE / 2
 const HEIGHT := 32
 const WATER := 3
