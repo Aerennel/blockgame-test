@@ -1,4 +1,4 @@
-extends Node3D
+9extends Node3D
 
 const SIZE := 48
 const HALF := SIZE / 2
@@ -267,7 +267,7 @@ func _input(event):
 			yaw -= event.relative.x * LOOK_SENS
 			pitch = clampf(pitch - event.relative.y * LOOK_SENS, -1.5, 1.5)
 
-func _process(delta):
+func _process(delta: float):
 	delta = minf(delta, 0.05)
 	var sz := get_viewport().get_visible_rect().size
 	hud.size = sz
