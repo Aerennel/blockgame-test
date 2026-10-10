@@ -17,6 +17,10 @@ const JUMP_V := 8.5
 const LOOK_SENS := 0.004
 const REPEAT := 0.22
 
+const SAVE_PATH := "user://world.dat"
+const SAVE_TMP := "user://world.tmp"
+const SAVE_VERSION := 1
+
 const GRASS := 1
 const DIRT := 2
 const SAND := 3
@@ -60,14 +64,20 @@ var place_cd := 0.0
 var joy_origin := Vector2.ZERO
 var joy_vec := Vector2.ZERO
 
+var world_ready := false
+var dirty := false
+var save_timer := 0.0
+var menu_open := false
+var confirm_new := false
+var menu: Control
+var menu_dim: ColorRect
+var btn_continue: Button
+var btn_new: Button
+
 func _ready():
 	block_mat = StandardMaterial3D.new()
 	block_mat.vertex_color_use_as_albedo = true
 	setup_env()
-	generate_world()
-	for cx in range(CN):
-		for cz in range(CN):
-			build_chunk(cx, cz)
 	add_water()
 	cam = Camera3D.new()
 	cam.near = 0.05
@@ -84,7 +94,17 @@ func _ready():
 		var c: Color = palette[t]
 		cols.append(c)
 	hud.slot_colors = cols
-	spawn()
+	build_menu()
+	if not load_world():
+		generate_world()
+		spawn()
+	build_all_chunks()
+	world_ready = true
+
+func _notification(what):
+	if what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_WM_CLOSE_REQUEST or what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		if world_ready:
+			save_world()
 
 func setup_env():
 	var env := WorldEnvironment.new()
@@ -185,8 +205,95 @@ func add_tree(x: int, h: int, z: int):
 		for dz in range(-1, 2):
 			set_block(x + dx, h + 5, z + dz, LEAVES)
 
+func rebuild_columns():
+	col_top.resize(SIZE * SIZE)
+	heights.resize(SIZE * SIZE)
+	for x in range(SIZE):
+		for z in range(SIZE):
+			var i := x * SIZE + z
+			var base := i * HEIGHT
+			var y := HEIGHT - 1
+			while y > 0 and blocks[base + y] == 0:
+				y -= 1
+			col_top[i] = y
+			while y > 0 and (blocks[base + y] == 0 or blocks[base + y] == WOOD or blocks[base + y] == LEAVES):
+				y -= 1
+			heights[i] = y
+
+func save_world():
+	var f := FileAccess.open_compressed(SAVE_TMP, FileAccess.WRITE, FileAccess.COMPRESSION_ZSTD)
+	if f == null:
+		return
+	f.store_32(SAVE_VERSION)
+	f.store_32(SIZE)
+	f.store_32(HEIGHT)
+	f.store_float(pos.x)
+	f.store_float(pos.y)
+	f.store_float(pos.z)
+	f.store_float(yaw)
+	f.store_float(pitch)
+	f.store_32(selected)
+	f.store_32(blocks.size())
+	f.store_buffer(blocks)
+	f.close()
+	var d := DirAccess.open("user://")
+	if d:
+		var err := d.rename("world.tmp", "world.dat")
+		if err != OK:
+			d.remove("world.dat")
+			d.rename("world.tmp", "world.dat")
+	dirty = false
+	save_timer = 0.0
+
+func load_world() -> bool:
+	if not FileAccess.file_exists(SAVE_PATH):
+		return false
+	var f := FileAccess.open_compressed(SAVE_PATH, FileAccess.READ, FileAccess.COMPRESSION_ZSTD)
+	if f == null:
+		return false
+	if f.get_32() != SAVE_VERSION or f.get_32() != SIZE or f.get_32() != HEIGHT:
+		f.close()
+		return false
+	var px := f.get_float()
+	var py := f.get_float()
+	var pz := f.get_float()
+	var yw := f.get_float()
+	var pt := f.get_float()
+	var sel := f.get_32()
+	var n := f.get_32()
+	if n != SIZE * SIZE * HEIGHT:
+		f.close()
+		return false
+	var data := f.get_buffer(n)
+	f.close()
+	if data.size() != n:
+		return false
+	blocks = data
+	rebuild_columns()
+	pos = Vector3(px, py, pz)
+	yaw = yw
+	pitch = pt
+	selected = clampi(sel, 0, hotbar.size() - 1)
+	vel = Vector3.ZERO
+	while collides(pos) and pos.y < HEIGHT:
+		pos.y += 1.0
+	return true
+
+func new_world():
+	generate_world()
+	spawn()
+	yaw = 0.0
+	pitch = 0.0
+	build_all_chunks()
+	save_world()
+
 func shade(x: int, y: int, z: int) -> float:
 	return 0.88 + 0.12 * fposmod(sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453, 1.0)
+
+func build_all_chunks():
+	for cx in range(CN):
+		for cz in range(CN):
+			build_chunk(cx, cz)
 
 func build_chunk(cx: int, cz: int):
 	var positions: Array[Vector3] = []
@@ -329,6 +436,7 @@ func do_break():
 		return
 	set_block(c.x, c.y, c.z, 0)
 	rebuild_around(c.x, c.z)
+	dirty = true
 
 func do_place():
 	var hit := raycast()
@@ -344,6 +452,69 @@ func do_place():
 		set_block(p.x, p.y, p.z, 0)
 		return
 	rebuild_around(p.x, p.z)
+	dirty = true
+
+func build_menu():
+	var ui := CanvasLayer.new()
+	ui.layer = 5
+	add_child(ui)
+	menu = Control.new()
+	menu.visible = false
+	ui.add_child(menu)
+	menu_dim = ColorRect.new()
+	menu_dim.color = Color(0, 0, 0, 0.6)
+	menu.add_child(menu_dim)
+	btn_continue = Button.new()
+	btn_continue.text = "Продолжить"
+	btn_continue.focus_mode = Control.FOCUS_NONE
+	btn_continue.pressed.connect(close_menu)
+	menu.add_child(btn_continue)
+	btn_new = Button.new()
+	btn_new.text = "Новый мир"
+	btn_new.focus_mode = Control.FOCUS_NONE
+	btn_new.pressed.connect(on_new_pressed)
+	menu.add_child(btn_new)
+
+func release_touches():
+	move_touch = -1
+	look_touch = -1
+	jump_touch = -1
+	break_touch = -1
+	place_touch = -1
+	joy_vec = Vector2.ZERO
+
+func open_menu():
+	save_world()
+	release_touches()
+	confirm_new = false
+	var sz := get_viewport().get_visible_rect().size
+	menu_dim.position = Vector2.ZERO
+	menu_dim.size = sz
+	var bw := sz.y * 0.9
+	var bh := sz.y * 0.16
+	var fs := int(sz.y * 0.06)
+	btn_continue.add_theme_font_size_override("font_size", fs)
+	btn_new.add_theme_font_size_override("font_size", fs)
+	btn_continue.size = Vector2(bw, bh)
+	btn_new.size = Vector2(bw, bh)
+	btn_continue.position = Vector2((sz.x - bw) * 0.5, sz.y * 0.28)
+	btn_new.position = Vector2((sz.x - bw) * 0.5, sz.y * 0.28 + bh * 1.4)
+	btn_new.text = "Новый мир"
+	menu.visible = true
+	menu_open = true
+
+func close_menu():
+	menu.visible = false
+	menu_open = false
+	confirm_new = false
+
+func on_new_pressed():
+	if not confirm_new:
+		confirm_new = true
+		btn_new.text = "Точно? Старый мир удалится"
+		return
+	new_world()
+	close_menu()
 
 func jump_center(sz: Vector2) -> Vector2:
 	return Vector2(sz.x - sz.y * 0.18, sz.y * 0.80)
@@ -353,6 +524,9 @@ func break_center(sz: Vector2) -> Vector2:
 
 func place_center(sz: Vector2) -> Vector2:
 	return Vector2(sz.x - sz.y * 0.42, sz.y * 0.80)
+
+func pause_center(sz: Vector2) -> Vector2:
+	return Vector2(sz.y * 0.1, sz.y * 0.1)
 
 func over_button(p: Vector2, c: Vector2, sz: Vector2) -> bool:
 	return p.distance_to(c) < sz.y * 0.11
@@ -371,11 +545,15 @@ func slot_hit(p: Vector2, sz: Vector2) -> int:
 	return -1
 
 func _input(event):
+	if menu_open:
+		return
 	var sz := get_viewport().get_visible_rect().size
 	if event is InputEventScreenTouch:
 		var p: Vector2 = event.position
 		if event.pressed:
-			if over_button(p, jump_center(sz), sz) and jump_touch == -1:
+			if p.distance_to(pause_center(sz)) < sz.y * 0.09:
+				open_menu()
+			elif over_button(p, jump_center(sz), sz) and jump_touch == -1:
 				jump_touch = event.index
 			elif over_button(p, break_center(sz), sz) and break_touch == -1:
 				break_touch = event.index
@@ -385,6 +563,7 @@ func _input(event):
 				place_cd = 0.0
 			elif slot_hit(p, sz) >= 0:
 				selected = slot_hit(p, sz)
+				dirty = true
 			elif p.x < sz.x * 0.4 and move_touch == -1:
 				move_touch = event.index
 				joy_origin = p
@@ -421,12 +600,19 @@ func _process(delta: float):
 	hud.jump_pos = jump_center(sz)
 	hud.break_pos = break_center(sz)
 	hud.place_pos = place_center(sz)
+	hud.pause_pos = pause_center(sz)
 	var rects: Array[Rect2] = []
 	for i in range(hotbar.size()):
 		rects.append(slot_rect(i, sz))
 	hud.slot_rects = rects
 	hud.selected = selected
 	hud.queue_redraw()
+	if menu_open:
+		return
+
+	save_timer += delta
+	if dirty and save_timer > 15.0:
+		save_world()
 
 	var jv := joy_vec
 	if jv.length() < 0.15:
@@ -485,6 +671,7 @@ class Hud extends Control:
 	var jump_pos := Vector2.ZERO
 	var break_pos := Vector2.ZERO
 	var place_pos := Vector2.ZERO
+	var pause_pos := Vector2.ZERO
 	var slot_rects: Array[Rect2] = []
 	var slot_colors: Array[Color] = []
 	var selected := 0
@@ -509,6 +696,9 @@ class Hud extends Control:
 		draw_circle(place_pos, r, Color(0.4, 1, 0.5, 0.25))
 		draw_line(place_pos + Vector2(-k, 0), place_pos + Vector2(k, 0), white, 5.0)
 		draw_line(place_pos + Vector2(0, -k), place_pos + Vector2(0, k), white, 5.0)
+		draw_circle(pause_pos, h * 0.055, Color(1, 1, 1, 0.18))
+		draw_rect(Rect2(pause_pos + Vector2(-h * 0.02, -h * 0.025), Vector2(h * 0.014, h * 0.05)), white)
+		draw_rect(Rect2(pause_pos + Vector2(h * 0.006, -h * 0.025), Vector2(h * 0.014, h * 0.05)), white)
 		for i in range(slot_rects.size()):
 			var rc := slot_rects[i]
 			draw_rect(rc, slot_colors[i])
