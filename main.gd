@@ -4,6 +4,9 @@ const SIZE := 48
 const HALF := SIZE / 2
 const HEIGHT := 32
 const WATER := 3
+const CHUNK := 16
+const CN := (SIZE + CHUNK - 1) / CHUNK
+const REACH := 6.0
 
 const PW := 0.3
 const PH := 1.8
@@ -12,6 +15,7 @@ const SPEED := 5.0
 const GRAVITY := 25.0
 const JUMP_V := 8.5
 const LOOK_SENS := 0.004
+const REPEAT := 0.22
 
 const GRASS := 1
 const DIRT := 2
@@ -31,10 +35,14 @@ var palette := [
 	Color(0.4, 0.26, 0.12),
 	Color(0.15, 0.5, 0.15),
 ]
+var hotbar := [GRASS, DIRT, STONE, SAND, WOOD, LEAVES]
+var selected := 0
 
 var blocks := PackedByteArray()
 var heights := PackedInt32Array()
-var mmi: MultiMeshInstance3D
+var col_top := PackedInt32Array()
+var chunks := {}
+var block_mat: StandardMaterial3D
 var cam: Camera3D
 var hud: Hud
 var pos := Vector3.ZERO
@@ -45,13 +53,21 @@ var pitch := 0.0
 var move_touch := -1
 var look_touch := -1
 var jump_touch := -1
+var break_touch := -1
+var place_touch := -1
+var break_cd := 0.0
+var place_cd := 0.0
 var joy_origin := Vector2.ZERO
 var joy_vec := Vector2.ZERO
 
 func _ready():
+	block_mat = StandardMaterial3D.new()
+	block_mat.vertex_color_use_as_albedo = true
 	setup_env()
 	generate_world()
-	build_mesh()
+	for cx in range(CN):
+		for cz in range(CN):
+			build_chunk(cx, cz)
 	add_water()
 	cam = Camera3D.new()
 	cam.near = 0.05
@@ -63,6 +79,11 @@ func _ready():
 	hud = Hud.new()
 	hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	layer.add_child(hud)
+	var cols: Array[Color] = []
+	for t in hotbar:
+		var c: Color = palette[t]
+		cols.append(c)
+	hud.slot_colors = cols
 	spawn()
 
 func setup_env():
@@ -82,10 +103,20 @@ func setup_env():
 func idx(x: int, y: int, z: int) -> int:
 	return (x * SIZE + z) * HEIGHT + y
 
+func in_world(x: int, y: int, z: int) -> bool:
+	return x >= 0 and x < SIZE and z >= 0 and z < SIZE and y >= 0 and y < HEIGHT
+
+func get_type(x: int, y: int, z: int) -> int:
+	if not in_world(x, y, z):
+		return 0
+	return blocks[idx(x, y, z)]
+
 func set_block(x: int, y: int, z: int, t: int):
-	if x < 0 or x >= SIZE or z < 0 or z >= SIZE or y < 0 or y >= HEIGHT:
+	if not in_world(x, y, z):
 		return
 	blocks[idx(x, y, z)] = t
+	if t != 0 and y > col_top[x * SIZE + z]:
+		col_top[x * SIZE + z] = y
 
 func is_solid(x: int, y: int, z: int) -> bool:
 	if y < 0:
@@ -112,6 +143,8 @@ func generate_world():
 	blocks.resize(SIZE * SIZE * HEIGHT)
 	blocks.fill(0)
 	heights.resize(SIZE * SIZE)
+	col_top.resize(SIZE * SIZE)
+	col_top.fill(0)
 	for x in range(SIZE):
 		for z in range(SIZE):
 			var h := int(round(noise.get_noise_2d(x - HALF, z - HALF) * 9.0 + 5.0))
@@ -155,12 +188,12 @@ func add_tree(x: int, h: int, z: int):
 func shade(x: int, y: int, z: int) -> float:
 	return 0.88 + 0.12 * fposmod(sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453, 1.0)
 
-func build_mesh():
+func build_chunk(cx: int, cz: int):
 	var positions: Array[Vector3] = []
 	var colors: Array[Color] = []
-	for x in range(SIZE):
-		for z in range(SIZE):
-			var top := mini(heights[x * SIZE + z] + 7, HEIGHT - 1)
+	for x in range(cx * CHUNK, mini((cx + 1) * CHUNK, SIZE)):
+		for z in range(cz * CHUNK, mini((cz + 1) * CHUNK, SIZE)):
+			var top := col_top[x * SIZE + z]
 			for y in range(top + 1):
 				var t := blocks[idx(x, y, z)]
 				if t == 0:
@@ -170,8 +203,6 @@ func build_mesh():
 					var s := shade(x, y, z)
 					positions.append(Vector3(x, y, z))
 					colors.append(Color(c.r * s, c.g * s, c.b * s))
-	if mmi:
-		mmi.queue_free()
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
@@ -180,12 +211,31 @@ func build_mesh():
 	for i in positions.size():
 		mm.set_instance_transform(i, Transform3D(Basis(), positions[i]))
 		mm.set_instance_color(i, colors[i])
-	mmi = MultiMeshInstance3D.new()
-	mmi.multimesh = mm
-	var mat := StandardMaterial3D.new()
-	mat.vertex_color_use_as_albedo = true
-	mmi.material_override = mat
-	add_child(mmi)
+	var key := Vector2i(cx, cz)
+	if chunks.has(key):
+		chunks[key].multimesh = mm
+	else:
+		var node := MultiMeshInstance3D.new()
+		node.multimesh = mm
+		node.material_override = block_mat
+		add_child(node)
+		chunks[key] = node
+
+func rebuild_around(x: int, z: int):
+	var cx := x / CHUNK
+	var cz := z / CHUNK
+	var list := {}
+	list[Vector2i(cx, cz)] = true
+	if x % CHUNK == 0 and cx > 0:
+		list[Vector2i(cx - 1, cz)] = true
+	if x % CHUNK == CHUNK - 1 and cx < CN - 1:
+		list[Vector2i(cx + 1, cz)] = true
+	if z % CHUNK == 0 and cz > 0:
+		list[Vector2i(cx, cz - 1)] = true
+	if z % CHUNK == CHUNK - 1 and cz < CN - 1:
+		list[Vector2i(cx, cz + 1)] = true
+	for k in list.keys():
+		build_chunk(k.x, k.y)
 
 func add_water():
 	var plane := MeshInstance3D.new()
@@ -236,20 +286,110 @@ func collides(p: Vector3) -> bool:
 					return true
 	return false
 
+func raycast() -> Dictionary:
+	var eye := pos + Vector3(0, EYE, 0)
+	var origin := eye + Vector3(0.5, 0.5, 0.5)
+	var dir := Vector3(-sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch))
+	var cell := Vector3i(floori(origin.x), floori(origin.y), floori(origin.z))
+	var prev := cell
+	var stepv := Vector3i.ZERO
+	var t_max := Vector3(INF, INF, INF)
+	var t_delta := Vector3(INF, INF, INF)
+	for a in range(3):
+		if dir[a] > 0.0:
+			stepv[a] = 1
+			t_delta[a] = 1.0 / dir[a]
+			t_max[a] = (cell[a] + 1 - origin[a]) / dir[a]
+		elif dir[a] < 0.0:
+			stepv[a] = -1
+			t_delta[a] = -1.0 / dir[a]
+			t_max[a] = (origin[a] - cell[a]) / -dir[a]
+	while true:
+		var ax := 0
+		if t_max.y < t_max[ax]:
+			ax = 1
+		if t_max.z < t_max[ax]:
+			ax = 2
+		var t: float = t_max[ax]
+		if t > REACH:
+			break
+		prev = cell
+		cell[ax] += stepv[ax]
+		t_max[ax] += t_delta[ax]
+		if get_type(cell.x, cell.y, cell.z) != 0:
+			return {"cell": cell, "prev": prev}
+	return {}
+
+func do_break():
+	var hit := raycast()
+	if hit.is_empty():
+		return
+	var c: Vector3i = hit["cell"]
+	if c.y == 0:
+		return
+	set_block(c.x, c.y, c.z, 0)
+	rebuild_around(c.x, c.z)
+
+func do_place():
+	var hit := raycast()
+	if hit.is_empty():
+		return
+	var p: Vector3i = hit["prev"]
+	if not in_world(p.x, p.y, p.z):
+		return
+	if get_type(p.x, p.y, p.z) != 0:
+		return
+	set_block(p.x, p.y, p.z, hotbar[selected])
+	if collides(pos):
+		set_block(p.x, p.y, p.z, 0)
+		return
+	rebuild_around(p.x, p.z)
+
 func jump_center(sz: Vector2) -> Vector2:
-	return Vector2(sz.x - sz.y * 0.2, sz.y * 0.78)
+	return Vector2(sz.x - sz.y * 0.18, sz.y * 0.80)
+
+func break_center(sz: Vector2) -> Vector2:
+	return Vector2(sz.x - sz.y * 0.18, sz.y * 0.55)
+
+func place_center(sz: Vector2) -> Vector2:
+	return Vector2(sz.x - sz.y * 0.42, sz.y * 0.80)
+
+func over_button(p: Vector2, c: Vector2, sz: Vector2) -> bool:
+	return p.distance_to(c) < sz.y * 0.11
+
+func slot_rect(i: int, sz: Vector2) -> Rect2:
+	var s := sz.y * 0.1
+	var gap := sz.y * 0.015
+	var total := hotbar.size() * s + (hotbar.size() - 1) * gap
+	var x0 := sz.x * 0.5 - total * 0.5
+	return Rect2(x0 + i * (s + gap), sz.y - s - gap * 1.5, s, s)
+
+func slot_hit(p: Vector2, sz: Vector2) -> int:
+	for i in range(hotbar.size()):
+		if slot_rect(i, sz).grow(sz.y * 0.01).has_point(p):
+			return i
+	return -1
 
 func _input(event):
 	var sz := get_viewport().get_visible_rect().size
 	if event is InputEventScreenTouch:
+		var p: Vector2 = event.position
 		if event.pressed:
-			if event.position.distance_to(jump_center(sz)) < sz.y * 0.12 and jump_touch == -1:
+			if over_button(p, jump_center(sz), sz) and jump_touch == -1:
 				jump_touch = event.index
-			elif event.position.x < sz.x * 0.4 and move_touch == -1:
+			elif over_button(p, break_center(sz), sz) and break_touch == -1:
+				break_touch = event.index
+				break_cd = 0.0
+			elif over_button(p, place_center(sz), sz) and place_touch == -1:
+				place_touch = event.index
+				place_cd = 0.0
+			elif slot_hit(p, sz) >= 0:
+				selected = slot_hit(p, sz)
+			elif p.x < sz.x * 0.4 and move_touch == -1:
 				move_touch = event.index
-				joy_origin = event.position
+				joy_origin = p
 				joy_vec = Vector2.ZERO
-			elif event.position.x >= sz.x * 0.4 and look_touch == -1:
+			elif p.x >= sz.x * 0.4 and look_touch == -1:
 				look_touch = event.index
 		else:
 			if event.index == move_touch:
@@ -259,6 +399,10 @@ func _input(event):
 				look_touch = -1
 			elif event.index == jump_touch:
 				jump_touch = -1
+			elif event.index == break_touch:
+				break_touch = -1
+			elif event.index == place_touch:
+				place_touch = -1
 	elif event is InputEventScreenDrag:
 		if event.index == move_touch:
 			var r := sz.y * 0.13
@@ -275,6 +419,13 @@ func _process(delta: float):
 	hud.joy_base = joy_origin
 	hud.joy_knob = joy_origin + joy_vec * sz.y * 0.13
 	hud.jump_pos = jump_center(sz)
+	hud.break_pos = break_center(sz)
+	hud.place_pos = place_center(sz)
+	var rects: Array[Rect2] = []
+	for i in range(hotbar.size()):
+		rects.append(slot_rect(i, sz))
+	hud.slot_rects = rects
+	hud.selected = selected
 	hud.queue_redraw()
 
 	var jv := joy_vec
@@ -318,11 +469,25 @@ func _process(delta: float):
 	cam.position = pos + Vector3(0, EYE, 0)
 	cam.rotation = Vector3(pitch, yaw, 0)
 
+	break_cd -= delta
+	place_cd -= delta
+	if break_touch != -1 and break_cd <= 0.0:
+		do_break()
+		break_cd = REPEAT
+	if place_touch != -1 and place_cd <= 0.0:
+		do_place()
+		place_cd = REPEAT
+
 class Hud extends Control:
 	var joy_active := false
 	var joy_base := Vector2.ZERO
 	var joy_knob := Vector2.ZERO
 	var jump_pos := Vector2.ZERO
+	var break_pos := Vector2.ZERO
+	var place_pos := Vector2.ZERO
+	var slot_rects: Array[Rect2] = []
+	var slot_colors: Array[Color] = []
+	var selected := 0
 
 	func _draw():
 		var h := size.y
@@ -330,10 +495,25 @@ class Hud extends Control:
 			draw_circle(joy_base, h * 0.13, Color(1, 1, 1, 0.12))
 			draw_circle(joy_knob, h * 0.055, Color(1, 1, 1, 0.35))
 		var r := h * 0.09
+		var k := r * 0.4
+		var white := Color(1, 1, 1, 0.7)
 		draw_circle(jump_pos, r, Color(1, 1, 1, 0.18))
 		var tri := PackedVector2Array([
 			jump_pos + Vector2(0, -r * 0.45),
 			jump_pos + Vector2(r * 0.45, r * 0.3),
 			jump_pos + Vector2(-r * 0.45, r * 0.3)])
 		draw_colored_polygon(tri, Color(1, 1, 1, 0.45))
+		draw_circle(break_pos, r, Color(1, 0.4, 0.4, 0.25))
+		draw_line(break_pos + Vector2(-k, -k), break_pos + Vector2(k, k), white, 5.0)
+		draw_line(break_pos + Vector2(-k, k), break_pos + Vector2(k, -k), white, 5.0)
+		draw_circle(place_pos, r, Color(0.4, 1, 0.5, 0.25))
+		draw_line(place_pos + Vector2(-k, 0), place_pos + Vector2(k, 0), white, 5.0)
+		draw_line(place_pos + Vector2(0, -k), place_pos + Vector2(0, k), white, 5.0)
+		for i in range(slot_rects.size()):
+			var rc := slot_rects[i]
+			draw_rect(rc, slot_colors[i])
+			if i == selected:
+				draw_rect(rc.grow(4.0), Color(1, 1, 1, 0.95), false, 4.0)
+			else:
+				draw_rect(rc, Color(0, 0, 0, 0.4), false, 2.0)
 		draw_circle(size * 0.5, 3.0, Color(1, 1, 1, 0.6))
