@@ -58,7 +58,10 @@ jobs:
 
       - name: Run check
         run: |
-          timeout 120 godot --headless --path . --quit-after 100 2>&1 | tail -n 40 || true
+          wc -l main.gd
+          head -n 3 main.gd | cat -A | cut -c1-70
+          grep -nP '^(?!\t|$)' main.gd | grep -vP '^\d+:(extends|const|var|func|class|@|#)' | head -n 10 || true
+          timeout 120 godot --headless --path . --check-only --script res://main.gd 2>&1 | tail -n 20 || true
 
       - name: Export APK
         shell: bash
