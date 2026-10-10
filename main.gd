@@ -29,6 +29,13 @@ const STONE := 4
 const SNOW := 5
 const WOOD := 6
 const LEAVES := 7
+const PLANKS := 8
+const BRICK := 9
+const GLASS := 10
+const COAL := 11
+const IRON := 12
+const GOLD := 13
+const DIAMOND := 14
 
 var palette := [
 	Color(0, 0, 0),
@@ -39,15 +46,25 @@ var palette := [
 	Color(0.95, 0.95, 0.97),
 	Color(0.4, 0.26, 0.12),
 	Color(0.15, 0.5, 0.15),
+	Color(0.72, 0.55, 0.32),
+	Color(0.65, 0.28, 0.22),
+	Color(0.8, 0.92, 1.0),
+	Color(0.2, 0.2, 0.22),
+	Color(0.75, 0.62, 0.52),
+	Color(0.95, 0.8, 0.2),
+	Color(0.3, 0.88, 0.9),
 ]
-var hotbar := [GRASS, DIRT, STONE, SAND, WOOD, LEAVES]
+var hotbar := [GRASS, DIRT, STONE, SAND, WOOD, PLANKS, BRICK, GLASS, LEAVES]
 var selected := 0
 
 var blocks := PackedByteArray()
 var heights := PackedInt32Array()
 var col_top := PackedInt32Array()
 var chunks := {}
+var gchunks := {}
+var box_mesh: BoxMesh
 var block_mat: StandardMaterial3D
+var glass_mat: StandardMaterial3D
 var cam: Camera3D
 var hud: Hud
 var pos := Vector3.ZERO
@@ -77,8 +94,12 @@ var btn_continue: Button
 var btn_new: Button
 
 func _ready():
+	box_mesh = BoxMesh.new()
 	block_mat = StandardMaterial3D.new()
 	block_mat.vertex_color_use_as_albedo = true
+	glass_mat = StandardMaterial3D.new()
+	glass_mat.vertex_color_use_as_albedo = true
+	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	setup_env()
 	add_water()
 	cam = Camera3D.new()
@@ -156,12 +177,26 @@ func is_air(x: int, y: int, z: int) -> bool:
 		return true
 	return blocks[idx(x, y, z)] == 0
 
+func is_clear(x: int, y: int, z: int) -> bool:
+	if y < 0:
+		return false
+	if y >= HEIGHT or x < 0 or x >= SIZE or z < 0 or z >= SIZE:
+		return true
+	var t := blocks[idx(x, y, z)]
+	return t == 0 or t == GLASS
+
 func generate_world():
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
 	var noise := FastNoiseLite.new()
 	noise.seed = rng.randi()
 	noise.frequency = 0.035
+	var cave_a := FastNoiseLite.new()
+	cave_a.seed = rng.randi()
+	cave_a.frequency = 0.06
+	var cave_b := FastNoiseLite.new()
+	cave_b.seed = rng.randi()
+	cave_b.frequency = 0.06
 	blocks.resize(SIZE * SIZE * HEIGHT)
 	blocks.fill(0)
 	heights.resize(SIZE * SIZE)
@@ -173,7 +208,7 @@ func generate_world():
 			h = clampi(h, 1, 14)
 			heights[x * SIZE + z] = h
 			for y in range(h + 1):
-				var t := DIRT
+				var t := STONE
 				if y == h:
 					if h <= WATER + 1:
 						t = SAND
@@ -183,8 +218,21 @@ func generate_world():
 						t = STONE
 					else:
 						t = GRASS
-				elif h >= 9:
-					t = STONE
+				elif h < 9 and y > h - 4:
+					t = DIRT
+				else:
+					if y >= 4 and absf(cave_a.get_noise_3d(x, y, z)) < 0.11 and absf(cave_b.get_noise_3d(x, y, z)) < 0.11:
+						continue
+					var r := rng.randf()
+					if y < h - 2 and r < 0.02:
+						if r < 0.001:
+							t = DIAMOND
+						elif r < 0.003:
+							t = GOLD
+						elif r < 0.008:
+							t = IRON
+						else:
+							t = COAL
 				set_block(x, y, z, t)
 	for x in range(3, SIZE - 3):
 		for z in range(3, SIZE - 3):
@@ -297,9 +345,32 @@ func build_all_chunks():
 		for cz in range(CN):
 			build_chunk(cx, cz)
 
+func make_mm(positions: Array[Vector3], colors: Array[Color]) -> MultiMesh:
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = box_mesh
+	mm.instance_count = positions.size()
+	for i in positions.size():
+		mm.set_instance_transform(i, Transform3D(Basis(), positions[i]))
+		mm.set_instance_color(i, colors[i])
+	return mm
+
+func set_chunk_node(store: Dictionary, key: Vector2i, mm: MultiMesh, mat: Material):
+	if store.has(key):
+		store[key].multimesh = mm
+	else:
+		var node := MultiMeshInstance3D.new()
+		node.multimesh = mm
+		node.material_override = mat
+		add_child(node)
+		store[key] = node
+
 func build_chunk(cx: int, cz: int):
 	var positions: Array[Vector3] = []
 	var colors: Array[Color] = []
+	var gpos: Array[Vector3] = []
+	var gcols: Array[Color] = []
 	for x in range(cx * CHUNK, mini((cx + 1) * CHUNK, SIZE)):
 		for z in range(cz * CHUNK, mini((cz + 1) * CHUNK, SIZE)):
 			var top := col_top[x * SIZE + z]
@@ -307,28 +378,18 @@ func build_chunk(cx: int, cz: int):
 				var t := blocks[idx(x, y, z)]
 				if t == 0:
 					continue
-				if is_air(x - 1, y, z) or is_air(x + 1, y, z) or is_air(x, y - 1, z) or is_air(x, y + 1, z) or is_air(x, y, z - 1) or is_air(x, y, z + 1):
+				if t == GLASS:
+					if is_air(x - 1, y, z) or is_air(x + 1, y, z) or is_air(x, y - 1, z) or is_air(x, y + 1, z) or is_air(x, y, z - 1) or is_air(x, y, z + 1):
+						gpos.append(Vector3(x, y, z))
+						gcols.append(Color(0.8, 0.92, 1.0, 0.35))
+				elif is_clear(x - 1, y, z) or is_clear(x + 1, y, z) or is_clear(x, y - 1, z) or is_clear(x, y + 1, z) or is_clear(x, y, z - 1) or is_clear(x, y, z + 1):
 					var c: Color = palette[t]
 					var s := shade(x, y, z)
 					positions.append(Vector3(x, y, z))
 					colors.append(Color(c.r * s, c.g * s, c.b * s))
-	var mm := MultiMesh.new()
-	mm.transform_format = MultiMesh.TRANSFORM_3D
-	mm.use_colors = true
-	mm.mesh = BoxMesh.new()
-	mm.instance_count = positions.size()
-	for i in positions.size():
-		mm.set_instance_transform(i, Transform3D(Basis(), positions[i]))
-		mm.set_instance_color(i, colors[i])
 	var key := Vector2i(cx, cz)
-	if chunks.has(key):
-		chunks[key].multimesh = mm
-	else:
-		var node := MultiMeshInstance3D.new()
-		node.multimesh = mm
-		node.material_override = block_mat
-		add_child(node)
-		chunks[key] = node
+	set_chunk_node(chunks, key, make_mm(positions, colors), block_mat)
+	set_chunk_node(gchunks, key, make_mm(gpos, gcols), glass_mat)
 
 func rebuild_around(x: int, z: int):
 	var cx := x / CHUNK
