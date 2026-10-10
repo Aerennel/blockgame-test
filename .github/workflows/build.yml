@@ -63,3 +63,8 @@ jobs:
           set -o pipefail
           mkdir -p build
           godot --headless --verbose --export-debug "Android" build/blockgame.apk 2>&1 | grep -v "is not exposed"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blockgame-apk
+          path: build/blockgame.apk
