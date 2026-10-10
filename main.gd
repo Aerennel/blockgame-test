@@ -4,6 +4,7 @@ const SIZE := 128
 const HALF := SIZE / 2
 const HEIGHT := 32
 const WATER := 3
+const WL := WATER + 0.4
 const CHUNK := 16
 const CN := (SIZE + CHUNK - 1) / CHUNK
 const REACH := 6.0
@@ -52,6 +53,7 @@ var hud: Hud
 var pos := Vector3.ZERO
 var vel := Vector3.ZERO
 var on_ground := false
+var in_water := false
 var yaw := 0.0
 var pitch := 0.0
 var move_touch := -1
@@ -355,7 +357,7 @@ func add_water():
 	wm.cull_mode = BaseMaterial3D.CULL_DISABLED
 	plane.material_override = wm
 	var c := (SIZE - 1) * 0.5
-	plane.position = Vector3(c, WATER + 0.4, c)
+	plane.position = Vector3(c, WL, c)
 	add_child(plane)
 
 func spawn():
@@ -601,6 +603,7 @@ func _process(delta: float):
 	hud.break_pos = break_center(sz)
 	hud.place_pos = place_center(sz)
 	hud.pause_pos = pause_center(sz)
+	hud.underwater = pos.y + EYE < WL
 	var rects: Array[Rect2] = []
 	for i in range(hotbar.size()):
 		rects.append(slot_rect(i, sz))
@@ -614,12 +617,17 @@ func _process(delta: float):
 	if dirty and save_timer > 15.0:
 		save_world()
 
+	in_water = pos.y + 0.6 < WL
+	var spd := SPEED
+	if in_water:
+		spd = SPEED * 0.6
+
 	var jv := joy_vec
 	if jv.length() < 0.15:
 		jv = Vector2.ZERO
 	var fwd := Vector3(-sin(yaw), 0, -cos(yaw))
 	var right := Vector3(cos(yaw), 0, -sin(yaw))
-	var step := (right * jv.x + fwd * -jv.y) * SPEED * delta
+	var step := (right * jv.x + fwd * -jv.y) * spd * delta
 
 	var blocked := false
 	if step.x != 0.0:
@@ -633,12 +641,25 @@ func _process(delta: float):
 			pos.z -= step.z
 			blocked = true
 
-	if blocked and on_ground and not collides(pos + step + Vector3(0, 1.05, 0)):
+	if blocked and (on_ground or in_water) and not collides(pos + step + Vector3(0, 1.05, 0)):
 		vel.y = JUMP_V
-	elif jump_touch != -1 and on_ground:
+		if in_water:
+			vel.y = 10.0
+	elif jump_touch != -1 and on_ground and not in_water:
 		vel.y = JUMP_V
 
-	vel.y = maxf(vel.y - GRAVITY * delta, -18.0)
+	if in_water:
+		if jump_touch != -1 and pos.y + 1.3 < WL:
+			if vel.y < 3.5:
+				vel.y = minf(vel.y + 20.0 * delta, 3.5)
+		else:
+			var dec := 6.0
+			if vel.y > 0.0:
+				dec = GRAVITY
+			vel.y = maxf(vel.y - dec * delta, -3.0)
+	else:
+		vel.y = maxf(vel.y - GRAVITY * delta, -18.0)
+
 	pos.y += vel.y * delta
 	on_ground = false
 	if collides(pos):
@@ -672,12 +693,15 @@ class Hud extends Control:
 	var break_pos := Vector2.ZERO
 	var place_pos := Vector2.ZERO
 	var pause_pos := Vector2.ZERO
+	var underwater := false
 	var slot_rects: Array[Rect2] = []
 	var slot_colors: Array[Color] = []
 	var selected := 0
 
 	func _draw():
 		var h := size.y
+		if underwater:
+			draw_rect(Rect2(Vector2.ZERO, size), Color(0.1, 0.35, 0.8, 0.3))
 		if joy_active:
 			draw_circle(joy_base, h * 0.13, Color(1, 1, 1, 0.12))
 			draw_circle(joy_knob, h * 0.055, Color(1, 1, 1, 0.35))
