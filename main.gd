@@ -213,7 +213,7 @@ func generate_world():
 	var noise := FastNoiseLite.new()
 	noise.seed = rng.randi()
 	noise.frequency = 0.035
-	var cave_a := FastNoiseLite.new()
+		var cave_a := FastNoiseLite.new()
 	cave_a.seed = rng.randi()
 	cave_a.frequency = 0.06
 	var cave_b := FastNoiseLite.new()
@@ -251,9 +251,9 @@ func generate_world():
 					t = DIRT
 				else:
 					if h >= WATER + 2 and y >= 3:
-						if absf(cave_a.get_noise_3d(x, y, z)) < 0.13 and absf(cave_b.get_noise_3d(x, y, z)) < 0.13:
+												if absf(cave_a.get_noise_3d(x, y * 1.3, z)) < cave_w and absf(cave_b.get_noise_3d(x, y * 1.3, z)) < cave_w:
 							continue
-						if y < h - 6 and cave_c.get_noise_3d(x, y, z) > 0.52:
+						if y < h - 8 and cave_c.get_noise_3d(x, y * 1.3, z) > 0.5:
 							continue
 					var r := rng.randf()
 					if y < h - 2 and r < 0.02:
