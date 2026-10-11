@@ -8,6 +8,7 @@ const WL := WATER + 0.4
 const CHUNK := 16
 const CN := (SIZE + CHUNK - 1) / CHUNK
 const REACH := 6.0
+const DAY_LEN := 480.0
 
 const PW := 0.3
 const PH := 1.8
@@ -20,6 +21,7 @@ const REPEAT := 0.22
 
 const SAVE_PATH := "user://world.dat"
 const SAVE_TMP := "user://world.tmp"
+const STATE_PATH := "user://state.cfg"
 const SAVE_VERSION := 2
 
 const GRASS := 1
@@ -36,6 +38,7 @@ const COAL := 11
 const IRON := 12
 const GOLD := 13
 const DIAMOND := 14
+const TORCH := 15
 
 var palette := [
 	Color(0, 0, 0),
@@ -53,22 +56,43 @@ var palette := [
 	Color(0.75, 0.62, 0.52),
 	Color(0.95, 0.8, 0.2),
 	Color(0.3, 0.88, 0.9),
+	Color(1.0, 0.7, 0.2),
 ]
-var hotbar := [GRASS, DIRT, STONE, SAND, WOOD, PLANKS, BRICK, GLASS, LEAVES]
+var hotbar := [GRASS, DIRT, STONE, SAND, WOOD, PLANKS, BRICK, GLASS, LEAVES, TORCH]
 var selected := 0
 
+var ndx := PackedInt32Array([1, -1, 0, 0, 0, 0])
+var ndy := PackedInt32Array([0, 0, 1, -1, 0, 0])
+var ndz := PackedInt32Array([0, 0, 0, 0, 1, -1])
+
 var blocks := PackedByteArray()
+var light := PackedByteArray()
 var heights := PackedInt32Array()
 var col_top := PackedInt32Array()
 var water_map := PackedByteArray()
+var bfs_q := PackedInt32Array()
+var rem_q := PackedInt32Array()
+var rem_lv := PackedInt32Array()
+var changed := {}
+var track := false
+var torch_cells := {}
 var chunks := {}
 var gchunks := {}
 var water_node: MultiMeshInstance3D
+var torch_node: MultiMeshInstance3D
 var box_mesh: BoxMesh
 var plane_mesh: PlaneMesh
-var block_mat: StandardMaterial3D
-var glass_mat: StandardMaterial3D
+var torch_mesh: BoxMesh
+var block_mat: ShaderMaterial
+var glass_mat: ShaderMaterial
 var water_mat: StandardMaterial3D
+var torch_mat: StandardMaterial3D
+var env_res: Environment
+var sky_root: Node3D
+var sun_node: MeshInstance3D
+var moon_node: MeshInstance3D
+var star_mat: StandardMaterial3D
+var day_time := DAY_LEN * 0.08
 var cam: Camera3D
 var hud: Hud
 var pos := Vector3.ZERO
@@ -97,20 +121,68 @@ var menu_dim: ColorRect
 var btn_continue: Button
 var btn_new: Button
 
+func make_shader(glass: bool) -> Shader:
+	var code := """shader_type spatial;
+render_mode unshaded;
+
+uniform float day = 1.0;
+
+varying vec3 v_col;
+varying vec2 v_light;
+varying float v_face;
+varying float v_a;
+
+void vertex() {
+	v_col = COLOR.rgb;
+	v_a = COLOR.a;
+	v_light = INSTANCE_CUSTOM.xy;
+	float s = 0.78;
+	if (NORMAL.y > 0.5) {
+		s = 1.0;
+	} else if (NORMAL.y < -0.5) {
+		s = 0.55;
+	} else if (abs(NORMAL.x) > 0.5) {
+		s = 0.68;
+	}
+	v_face = s;
+}
+
+void fragment() {
+	float sl = pow(clamp(v_light.x * day, 0.0, 1.0), 1.6);
+	float bl = pow(clamp(v_light.y, 0.0, 1.0), 1.6);
+	vec3 sky_c = mix(vec3(0.5, 0.6, 1.0), vec3(1.0), day) * sl;
+	vec3 blk_c = vec3(1.0, 0.78, 0.5) * bl;
+	vec3 lit = max(sky_c, blk_c);
+	lit = max(lit, vec3(0.03, 0.035, 0.06));
+	ALBEDO = v_col * v_face * lit;
+}
+"""
+	if glass:
+		code = code.replace("ALBEDO = v_col * v_face * lit;", "ALBEDO = v_col * v_face * lit;\n\tALPHA = v_a;")
+	var sh := Shader.new()
+	sh.code = code
+	return sh
+
 func _ready():
 	box_mesh = BoxMesh.new()
 	plane_mesh = PlaneMesh.new()
 	plane_mesh.size = Vector2(1, 1)
-	block_mat = StandardMaterial3D.new()
-	block_mat.vertex_color_use_as_albedo = true
-	glass_mat = StandardMaterial3D.new()
-	glass_mat.vertex_color_use_as_albedo = true
-	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	torch_mesh = BoxMesh.new()
+	torch_mesh.size = Vector3(0.18, 0.6, 0.18)
+	block_mat = ShaderMaterial.new()
+	block_mat.shader = make_shader(false)
+	glass_mat = ShaderMaterial.new()
+	glass_mat.shader = make_shader(true)
 	water_mat = StandardMaterial3D.new()
-	water_mat.albedo_color = Color(0.2, 0.45, 0.85, 0.65)
+	water_mat.albedo_color = Color(0.25, 0.55, 0.95, 0.65)
+	water_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	water_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	water_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	torch_mat = StandardMaterial3D.new()
+	torch_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	torch_mat.albedo_color = Color(1.0, 0.72, 0.25)
 	setup_env()
+	setup_sky()
 	cam = Camera3D.new()
 	cam.near = 0.05
 	cam.far = 400.0
@@ -127,11 +199,14 @@ func _ready():
 		cols.append(c)
 	hud.slot_colors = cols
 	build_menu()
+	load_state()
 	if not load_world():
 		generate_world()
 		spawn()
+	compute_all_light()
 	build_all_chunks()
 	build_water()
+	build_torches()
 	world_ready = true
 
 func _notification(what):
@@ -141,17 +216,91 @@ func _notification(what):
 
 func setup_env():
 	var env := WorldEnvironment.new()
-	var e := Environment.new()
-	e.background_mode = Environment.BG_COLOR
-	e.background_color = Color(0.53, 0.81, 0.92)
-	e.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	e.ambient_light_color = Color(1, 1, 1)
-	e.ambient_light_energy = 0.5
-	env.environment = e
+	env_res = Environment.new()
+	env_res.background_mode = Environment.BG_COLOR
+	env_res.background_color = Color(0.53, 0.81, 0.92)
+	env.environment = env_res
 	add_child(env)
-	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-50, 30, 0)
-	add_child(sun)
+
+func setup_sky():
+	sky_root = Node3D.new()
+	add_child(sky_root)
+	var sun_mat := StandardMaterial3D.new()
+	sun_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sun_mat.albedo_color = Color(1.0, 0.95, 0.7)
+	sun_mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	var sun_quad := QuadMesh.new()
+	sun_quad.size = Vector2(45, 45)
+	sun_node = MeshInstance3D.new()
+	sun_node.mesh = sun_quad
+	sun_node.material_override = sun_mat
+	sky_root.add_child(sun_node)
+	var moon_mat := StandardMaterial3D.new()
+	moon_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	moon_mat.albedo_color = Color(0.85, 0.9, 1.0)
+	moon_mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	var moon_quad := QuadMesh.new()
+	moon_quad.size = Vector2(32, 32)
+	moon_node = MeshInstance3D.new()
+	moon_node.mesh = moon_quad
+	moon_node.material_override = moon_mat
+	sky_root.add_child(moon_node)
+	star_mat = StandardMaterial3D.new()
+	star_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	star_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	star_mat.albedo_color = Color(1, 1, 1, 0)
+	star_mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	var star_quad := QuadMesh.new()
+	star_quad.size = Vector2(1.4, 1.4)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 12345
+	var spos: Array[Vector3] = []
+	for i in range(220):
+		var v := Vector3(rng.randfn(), rng.randfn(), rng.randfn())
+		if v.length() < 0.001:
+			continue
+		spos.append(v.normalized() * 255.0)
+	var smm := MultiMesh.new()
+	smm.transform_format = MultiMesh.TRANSFORM_3D
+	smm.mesh = star_quad
+	smm.instance_count = spos.size()
+	for i in range(spos.size()):
+		smm.set_instance_transform(i, Transform3D(Basis(), spos[i]))
+	var star_node := MultiMeshInstance3D.new()
+	star_node.multimesh = smm
+	star_node.material_override = star_mat
+	sky_root.add_child(star_node)
+
+func update_sky():
+	var a := day_time / DAY_LEN * TAU
+	var sh := sin(a) + 0.15
+	var d := smoothstep(-0.05, 0.3, sh)
+	var day_u := lerpf(0.28, 1.0, d)
+	block_mat.set_shader_parameter("day", day_u)
+	glass_mat.set_shader_parameter("day", day_u)
+	var sky_c := Color(0.02, 0.03, 0.09).lerp(Color(0.53, 0.81, 0.92), d)
+	var g := clampf(1.0 - absf(sh) / 0.3, 0.0, 1.0)
+	sky_c = sky_c.lerp(Color(0.95, 0.55, 0.35), g * 0.5)
+	env_res.background_color = sky_c
+	var k := lerpf(0.2, 1.0, d)
+	water_mat.albedo_color = Color(0.25 * k, 0.55 * k, 0.95 * k, 0.65)
+	star_mat.albedo_color = Color(1, 1, 1, clampf(1.0 - d * 1.6, 0.0, 1.0))
+	var sd := Vector3(cos(a), sin(a), 0.3).normalized()
+	sky_root.position = cam.position
+	sun_node.position = sd * 250.0
+	moon_node.position = -sd * 250.0
+	sun_node.visible = sh > -0.08
+	moon_node.visible = sh < 0.08
+
+func save_state():
+	var cfg := ConfigFile.new()
+	cfg.set_value("s", "t", day_time)
+	cfg.save(STATE_PATH)
+
+func load_state():
+	var cfg := ConfigFile.new()
+	if cfg.load(STATE_PATH) == OK:
+		day_time = float(cfg.get_value("s", "t", day_time))
 
 func idx(x: int, y: int, z: int) -> int:
 	return (x * SIZE + z) * HEIGHT + y
@@ -178,22 +327,8 @@ func is_solid(x: int, y: int, z: int) -> bool:
 		return false
 	if x < 0 or x >= SIZE or z < 0 or z >= SIZE:
 		return true
-	return blocks[idx(x, y, z)] != 0
-
-func is_air(x: int, y: int, z: int) -> bool:
-	if y < 0:
-		return false
-	if y >= HEIGHT or x < 0 or x >= SIZE or z < 0 or z >= SIZE:
-		return true
-	return blocks[idx(x, y, z)] == 0
-
-func is_clear(x: int, y: int, z: int) -> bool:
-	if y < 0:
-		return false
-	if y >= HEIGHT or x < 0 or x >= SIZE or z < 0 or z >= SIZE:
-		return true
 	var t := blocks[idx(x, y, z)]
-	return t == 0 or t == GLASS
+	return t != 0 and t != TORCH
 
 func water_at(wx: float, wy: float, wz: float) -> bool:
 	if wy > WL:
@@ -303,9 +438,208 @@ func rebuild_columns():
 			while y > 0 and blocks[base + y] == 0:
 				y -= 1
 			col_top[i] = y
-			while y > 0 and (blocks[base + y] == 0 or blocks[base + y] == WOOD or blocks[base + y] == LEAVES):
+			while y > 0 and (blocks[base + y] == 0 or blocks[base + y] == WOOD or blocks[base + y] == LEAVES or blocks[base + y] == TORCH):
 				y -= 1
 			heights[i] = y
+
+func get_l(i: int, ch: int) -> int:
+	return (light[i] >> (ch * 4)) & 15
+
+func set_l(i: int, ch: int, v: int):
+	if ch == 0:
+		light[i] = (light[i] & 240) | v
+	else:
+		light[i] = (light[i] & 15) | (v << 4)
+
+func mark_chunk(x: int, z: int):
+	var cx := x / CHUNK
+	var cz := z / CHUNK
+	changed[Vector2i(cx, cz)] = true
+	var lx := x % CHUNK
+	var lz := z % CHUNK
+	if lx == 0 and cx > 0:
+		changed[Vector2i(cx - 1, cz)] = true
+	if lx == CHUNK - 1 and cx < CN - 1:
+		changed[Vector2i(cx + 1, cz)] = true
+	if lz == 0 and cz > 0:
+		changed[Vector2i(cx, cz - 1)] = true
+	if lz == CHUNK - 1 and cz < CN - 1:
+		changed[Vector2i(cx, cz + 1)] = true
+
+func mark_changed(i: int):
+	var col := i / HEIGHT
+	mark_chunk(col / SIZE, col % SIZE)
+
+func flush_changed():
+	for k in changed.keys():
+		build_chunk(k.x, k.y)
+	changed.clear()
+
+func spread(ch: int):
+	var head := 0
+	while head < bfs_q.size():
+		var i := bfs_q[head]
+		head += 1
+		var l := (light[i] >> (ch * 4)) & 15
+		if l <= 1:
+			continue
+		var y := i % HEIGHT
+		var col := i / HEIGHT
+		var z := col % SIZE
+		var x := col / SIZE
+		for d in range(6):
+			var nx := x + ndx[d]
+			var ny := y + ndy[d]
+			var nz := z + ndz[d]
+			if nx < 0 or nx >= SIZE or ny < 0 or ny >= HEIGHT or nz < 0 or nz >= SIZE:
+				continue
+			var ni := (nx * SIZE + nz) * HEIGHT + ny
+			var t := blocks[ni]
+			if t != 0 and t != GLASS and t != TORCH:
+				continue
+			var nl := l - 1
+			if ch == 0 and d == 3 and l == 15:
+				nl = 15
+			if ((light[ni] >> (ch * 4)) & 15) < nl:
+				set_l(ni, ch, nl)
+				bfs_q.append(ni)
+				if track:
+					mark_changed(ni)
+
+func unspread(start: int, ch: int):
+	rem_q.clear()
+	rem_lv.clear()
+	bfs_q.clear()
+	var old := get_l(start, ch)
+	set_l(start, ch, 0)
+	rem_q.append(start)
+	rem_lv.append(old)
+	var head := 0
+	while head < rem_q.size():
+		var i := rem_q[head]
+		var ol := rem_lv[head]
+		head += 1
+		var y := i % HEIGHT
+		var col := i / HEIGHT
+		var z := col % SIZE
+		var x := col / SIZE
+		for d in range(6):
+			var nx := x + ndx[d]
+			var ny := y + ndy[d]
+			var nz := z + ndz[d]
+			if nx < 0 or nx >= SIZE or ny < 0 or ny >= HEIGHT or nz < 0 or nz >= SIZE:
+				continue
+			var ni := (nx * SIZE + nz) * HEIGHT + ny
+			var nl := get_l(ni, ch)
+			if nl == 0:
+				continue
+			var dep := nl < ol
+			if ch == 0 and d == 3 and ol == 15 and nl == 15:
+				dep = true
+			if dep:
+				set_l(ni, ch, 0)
+				rem_q.append(ni)
+				rem_lv.append(nl)
+				if track:
+					mark_changed(ni)
+			else:
+				bfs_q.append(ni)
+	spread(ch)
+
+func seed_from_neighbors(i: int, ch: int):
+	bfs_q.clear()
+	var y := i % HEIGHT
+	var col := i / HEIGHT
+	var z := col % SIZE
+	var x := col / SIZE
+	for d in range(6):
+		var nx := x + ndx[d]
+		var ny := y + ndy[d]
+		var nz := z + ndz[d]
+		if nx < 0 or nx >= SIZE or ny < 0 or ny >= HEIGHT or nz < 0 or nz >= SIZE:
+			continue
+		var ni := (nx * SIZE + nz) * HEIGHT + ny
+		if get_l(ni, ch) > 1:
+			bfs_q.append(ni)
+	spread(ch)
+
+func compute_all_light():
+	track = false
+	light.resize(SIZE * SIZE * HEIGHT)
+	light.fill(0)
+	var tops := PackedInt32Array()
+	tops.resize(SIZE * SIZE)
+	for x in range(SIZE):
+		for z in range(SIZE):
+			var base := (x * SIZE + z) * HEIGHT
+			var y := HEIGHT - 1
+			while y >= 0:
+				var t := blocks[base + y]
+				if t != 0 and t != GLASS and t != TORCH:
+					break
+				light[base + y] = 15
+				y -= 1
+			tops[x * SIZE + z] = y
+	bfs_q.clear()
+	for x in range(SIZE):
+		for z in range(SIZE):
+			var t0 := tops[x * SIZE + z]
+			var m := t0
+			if x > 0:
+				m = maxi(m, tops[(x - 1) * SIZE + z])
+			if x < SIZE - 1:
+				m = maxi(m, tops[(x + 1) * SIZE + z])
+			if z > 0:
+				m = maxi(m, tops[x * SIZE + z - 1])
+			if z < SIZE - 1:
+				m = maxi(m, tops[x * SIZE + z + 1])
+			var base2 := (x * SIZE + z) * HEIGHT
+			for y in range(t0 + 1, m + 1):
+				bfs_q.append(base2 + y)
+	spread(0)
+	torch_cells.clear()
+	bfs_q.clear()
+	var ti := blocks.find(TORCH)
+	while ti != -1:
+		var ty := ti % HEIGHT
+		var tcol := ti / HEIGHT
+		torch_cells[Vector3i(tcol / SIZE, ty, tcol % SIZE)] = true
+		set_l(ti, 1, 14)
+		bfs_q.append(ti)
+		ti = blocks.find(TORCH, ti + 1)
+	spread(1)
+
+func edit_block(x: int, y: int, z: int, new_t: int):
+	var i := idx(x, y, z)
+	var old_t := int(blocks[i])
+	var was_t := old_t == 0 or old_t == GLASS or old_t == TORCH
+	var now_t := new_t == 0 or new_t == GLASS or new_t == TORCH
+	track = true
+	changed.clear()
+	mark_chunk(x, z)
+	set_block(x, y, z, new_t)
+	if old_t == TORCH:
+		torch_cells.erase(Vector3i(x, y, z))
+		if get_l(i, 1) > 0:
+			unspread(i, 1)
+	if new_t == TORCH:
+		torch_cells[Vector3i(x, y, z)] = true
+	if was_t and not now_t:
+		for ch in range(2):
+			if get_l(i, ch) > 0:
+				unspread(i, ch)
+	elif (not was_t) and now_t:
+		for ch in range(2):
+			seed_from_neighbors(i, ch)
+	if new_t == TORCH:
+		set_l(i, 1, 14)
+		bfs_q.clear()
+		bfs_q.append(i)
+		spread(1)
+	track = false
+	flush_changed()
+	if old_t == TORCH or new_t == TORCH:
+		build_torches()
 
 func save_world():
 	var f := FileAccess.open_compressed(SAVE_TMP, FileAccess.WRITE, FileAccess.COMPRESSION_ZSTD)
@@ -331,6 +665,7 @@ func save_world():
 		if err != OK:
 			d.remove("world.dat")
 			d.rename("world.tmp", "world.dat")
+	save_state()
 	dirty = false
 	save_timer = 0.0
 
@@ -379,8 +714,11 @@ func new_world():
 	spawn()
 	yaw = 0.0
 	pitch = 0.0
+	day_time = DAY_LEN * 0.08
+	compute_all_light()
 	build_all_chunks()
 	build_water()
+	build_torches()
 	save_world()
 
 func shade(x: int, y: int, z: int) -> float:
@@ -402,6 +740,19 @@ func make_mm(positions: Array[Vector3], colors: Array[Color], mesh: Mesh) -> Mul
 		mm.set_instance_color(i, colors[i])
 	return mm
 
+func make_mm_lit(positions: Array[Vector3], colors: Array[Color], lights: Array[Color]) -> MultiMesh:
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.use_custom_data = true
+	mm.mesh = box_mesh
+	mm.instance_count = positions.size()
+	for i in positions.size():
+		mm.set_instance_transform(i, Transform3D(Basis(), positions[i]))
+		mm.set_instance_color(i, colors[i])
+		mm.set_instance_custom_data(i, lights[i])
+	return mm
+
 func set_chunk_node(store: Dictionary, key: Vector2i, mm: MultiMesh, mat: Material):
 	if store.has(key):
 		store[key].multimesh = mm
@@ -412,30 +763,88 @@ func set_chunk_node(store: Dictionary, key: Vector2i, mm: MultiMesh, mat: Materi
 		add_child(node)
 		store[key] = node
 
+func clear_light(x: int, y: int, z: int) -> int:
+	if y < 0:
+		return -1
+	if y >= HEIGHT or x < 0 or x >= SIZE or z < 0 or z >= SIZE:
+		return 15
+	var i := (x * SIZE + z) * HEIGHT + y
+	var t := blocks[i]
+	if t == 0 or t == GLASS or t == TORCH:
+		return light[i]
+	return -1
+
+func air_light(x: int, y: int, z: int) -> int:
+	if y < 0:
+		return -1
+	if y >= HEIGHT or x < 0 or x >= SIZE or z < 0 or z >= SIZE:
+		return 15
+	var i := (x * SIZE + z) * HEIGHT + y
+	var t := blocks[i]
+	if t == 0 or t == TORCH:
+		return light[i]
+	return -1
+
+func lmax(a: int, b: int, c: int, d: int, e: int, f: int, shift: int) -> int:
+	var m := 0
+	if a >= 0:
+		m = maxi(m, (a >> shift) & 15)
+	if b >= 0:
+		m = maxi(m, (b >> shift) & 15)
+	if c >= 0:
+		m = maxi(m, (c >> shift) & 15)
+	if d >= 0:
+		m = maxi(m, (d >> shift) & 15)
+	if e >= 0:
+		m = maxi(m, (e >> shift) & 15)
+	if f >= 0:
+		m = maxi(m, (f >> shift) & 15)
+	return m
+
 func build_chunk(cx: int, cz: int):
 	var positions: Array[Vector3] = []
 	var colors: Array[Color] = []
+	var lights: Array[Color] = []
 	var gpos: Array[Vector3] = []
 	var gcols: Array[Color] = []
+	var glights: Array[Color] = []
 	for x in range(cx * CHUNK, mini((cx + 1) * CHUNK, SIZE)):
 		for z in range(cz * CHUNK, mini((cz + 1) * CHUNK, SIZE)):
+			var base := (x * SIZE + z) * HEIGHT
 			var top := col_top[x * SIZE + z]
 			for y in range(top + 1):
-				var t := blocks[idx(x, y, z)]
-				if t == 0:
+				var t := blocks[base + y]
+				if t == 0 or t == TORCH:
 					continue
 				if t == GLASS:
-					if is_air(x - 1, y, z) or is_air(x + 1, y, z) or is_air(x, y - 1, z) or is_air(x, y + 1, z) or is_air(x, y, z - 1) or is_air(x, y, z + 1):
-						gpos.append(Vector3(x, y, z))
-						gcols.append(Color(0.8, 0.92, 1.0, 0.35))
-				elif is_clear(x - 1, y, z) or is_clear(x + 1, y, z) or is_clear(x, y - 1, z) or is_clear(x, y + 1, z) or is_clear(x, y, z - 1) or is_clear(x, y, z + 1):
-					var c: Color = palette[t]
+					var g1 := air_light(x - 1, y, z)
+					var g2 := air_light(x + 1, y, z)
+					var g3 := air_light(x, y - 1, z)
+					var g4 := air_light(x, y + 1, z)
+					var g5 := air_light(x, y, z - 1)
+					var g6 := air_light(x, y, z + 1)
+					if g1 < 0 and g2 < 0 and g3 < 0 and g4 < 0 and g5 < 0 and g6 < 0:
+						continue
+					gpos.append(Vector3(x, y, z))
+					gcols.append(Color(0.8, 0.92, 1.0, 0.35))
+					glights.append(Color(lmax(g1, g2, g3, g4, g5, g6, 0) / 15.0, lmax(g1, g2, g3, g4, g5, g6, 4) / 15.0, 0.0, 0.0))
+				else:
+					var l1 := clear_light(x - 1, y, z)
+					var l2 := clear_light(x + 1, y, z)
+					var l3 := clear_light(x, y - 1, z)
+					var l4 := clear_light(x, y + 1, z)
+					var l5 := clear_light(x, y, z - 1)
+					var l6 := clear_light(x, y, z + 1)
+					if l1 < 0 and l2 < 0 and l3 < 0 and l4 < 0 and l5 < 0 and l6 < 0:
+						continue
+					var bc: Color = palette[t]
 					var s := shade(x, y, z)
 					positions.append(Vector3(x, y, z))
-					colors.append(Color(c.r * s, c.g * s, c.b * s))
+					colors.append(Color(bc.r * s, bc.g * s, bc.b * s))
+					lights.append(Color(lmax(l1, l2, l3, l4, l5, l6, 0) / 15.0, lmax(l1, l2, l3, l4, l5, l6, 4) / 15.0, 0.0, 0.0))
 	var key := Vector2i(cx, cz)
-	set_chunk_node(chunks, key, make_mm(positions, colors, box_mesh), block_mat)
-	set_chunk_node(gchunks, key, make_mm(gpos, gcols, box_mesh), glass_mat)
+	set_chunk_node(chunks, key, make_mm_lit(positions, colors, lights), block_mat)
+	set_chunk_node(gchunks, key, make_mm_lit(gpos, gcols, glights), glass_mat)
 
 func build_water():
 	var positions: Array[Vector3] = []
@@ -452,21 +861,19 @@ func build_water():
 		add_child(water_node)
 	water_node.multimesh = mm
 
-func rebuild_around(x: int, z: int):
-	var cx := x / CHUNK
-	var cz := z / CHUNK
-	var list := {}
-	list[Vector2i(cx, cz)] = true
-	if x % CHUNK == 0 and cx > 0:
-		list[Vector2i(cx - 1, cz)] = true
-	if x % CHUNK == CHUNK - 1 and cx < CN - 1:
-		list[Vector2i(cx + 1, cz)] = true
-	if z % CHUNK == 0 and cz > 0:
-		list[Vector2i(cx, cz - 1)] = true
-	if z % CHUNK == CHUNK - 1 and cz < CN - 1:
-		list[Vector2i(cx, cz + 1)] = true
-	for k in list.keys():
-		build_chunk(k.x, k.y)
+func build_torches():
+	var positions: Array[Vector3] = []
+	var colors: Array[Color] = []
+	for k in torch_cells.keys():
+		var c: Vector3i = k
+		positions.append(Vector3(c.x, c.y - 0.2, c.z))
+		colors.append(Color(1, 1, 1, 1))
+	var mm := make_mm(positions, colors, torch_mesh)
+	if torch_node == null:
+		torch_node = MultiMeshInstance3D.new()
+		torch_node.material_override = torch_mat
+		add_child(torch_node)
+	torch_node.multimesh = mm
 
 func spawn():
 	var best := Vector2i(HALF, HALF)
@@ -544,8 +951,7 @@ func do_break():
 	var c: Vector3i = hit["cell"]
 	if c.y == 0:
 		return
-	set_block(c.x, c.y, c.z, 0)
-	rebuild_around(c.x, c.z)
+	edit_block(c.x, c.y, c.z, 0)
 	dirty = true
 
 func do_place():
@@ -557,11 +963,14 @@ func do_place():
 		return
 	if get_type(p.x, p.y, p.z) != 0:
 		return
-	set_block(p.x, p.y, p.z, hotbar[selected])
-	if collides(pos):
-		set_block(p.x, p.y, p.z, 0)
+	var t: int = hotbar[selected]
+	var i := idx(p.x, p.y, p.z)
+	blocks[i] = t
+	var hits_player := collides(pos)
+	blocks[i] = 0
+	if hits_player:
 		return
-	rebuild_around(p.x, p.z)
+	edit_block(p.x, p.y, p.z, t)
 	dirty = true
 
 func build_menu():
@@ -642,8 +1051,8 @@ func over_button(p: Vector2, c: Vector2, sz: Vector2) -> bool:
 	return p.distance_to(c) < sz.y * 0.11
 
 func slot_rect(i: int, sz: Vector2) -> Rect2:
-	var s := sz.y * 0.1
-	var gap := sz.y * 0.015
+	var s := sz.y * 0.09
+	var gap := sz.y * 0.0135
 	var total := hotbar.size() * s + (hotbar.size() - 1) * gap
 	var x0 := sz.x * 0.5 - total * 0.5
 	return Rect2(x0 + i * (s + gap), sz.y - s - gap * 1.5, s, s)
@@ -718,9 +1127,11 @@ func _process(delta: float):
 	hud.slot_rects = rects
 	hud.selected = selected
 	hud.queue_redraw()
+	update_sky()
 	if menu_open:
 		return
 
+	day_time = fposmod(day_time + delta, DAY_LEN)
 	save_timer += delta
 	if dirty and save_timer > 15.0:
 		save_world()
