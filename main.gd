@@ -1,4 +1,4 @@
-,extends Node3D
+extends Node3D
 
 const CHUNK := 16
 const WSIZE := 256
