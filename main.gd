@@ -1,4 +1,4 @@
-extends Node3D
+,extends Node3D
 
 const CHUNK := 16
 const WSIZE := 256
@@ -6,7 +6,7 @@ const WMASK := 255
 const HEIGHT := 40
 const WATER := 12
 const WL := WATER + 0.4
-const VIEW := 5
+const VIEW := 32
 const UNLOAD := 7
 const REACH := 6.0
 const DAY_LEN := 480.0
